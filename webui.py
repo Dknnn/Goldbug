@@ -656,16 +656,18 @@ function toast(msg){
 
 # ── 入口 ──────────────────────────────────────────────────
 if __name__ == "__main__":
-    import traceback, sys
-    try:
-        import webbrowser
-        port = 8820
-        import logging as _logging
-        _logging.getLogger("werkzeug").setLevel(_logging.WARNING)
-        print(f"  Goldbug Web UI: http://localhost:{port}")
-        webbrowser.open(f"http://localhost:{port}")
-        app.run(host="127.0.0.1", port=port, debug=False, threaded=True)
-    except Exception:
-        with open("webui_error.log", "w", encoding="utf-8") as f:
-            traceback.print_exc(file=f)
-        sys.exit(1)
+    import threading
+    port = 8820
+    import logging as _logging
+    _logging.getLogger("werkzeug").setLevel(_logging.WARNING)
+
+    # Flask 在后台线程运行
+    t = threading.Thread(target=app.run, daemon=True,
+                         kwargs={"host": "127.0.0.1", "port": port, "debug": False})
+    t.start()
+
+    # pywebview 原生窗口显示 Web UI
+    import webview
+    webview.create_window("Goldbug", f"http://localhost:{port}",
+                          width=1280, height=820, min_size=(900, 600))
+    webview.start()
