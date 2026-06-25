@@ -1,8 +1,6 @@
 # encoding: utf-8
 """
 Goldbug Web UI — 小红书爆款图片抓取工具可视化界面
-
-启动: python webui.py  → 浏览器打开 http://localhost:8820
 """
 
 import json
