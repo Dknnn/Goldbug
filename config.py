@@ -31,3 +31,11 @@ NOTE_SCROLL_TIMES = 2
 
 # Cookie 持久化（保存登录态，避免每次手动登录）
 STATE_FILE = "browser_state.json"  # 登录态持久化文件
+
+# 日期过滤：只抓取指定日期范围内发布的笔记（None = 不限）
+DATE_FILTER_START = None  # 起始日期 "YYYY-MM-DD"（None = 不限）
+DATE_FILTER_END = None    # 结束日期 "YYYY-MM-DD"（None = 不限）
+
+# 过滤截图：跳过白色背景占比过高的图片（聊天截图、手机截图等）
+SKIP_SCREENSHOTS = True       # 是否开启截图过滤
+SCREENSHOT_WHITE_RATIO = 0.7  # 白色/浅色像素占比阈值（0.7 = 70%）

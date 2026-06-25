@@ -16,10 +16,11 @@ import re
 import sys
 import time
 import hashlib
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 from urllib.parse import quote, urlparse
 
+from PIL import Image
 import requests
 from playwright.sync_api import sync_playwright, Page, TimeoutError as PlaywrightTimeout
 
@@ -40,6 +41,7 @@ logger = logging.getLogger("goldbug")
 # ── 常量 ─────────────────────────────────────────────────
 SEARCH_URL = "https://www.xiaohongshu.com/search_result?keyword={keyword}&source=web_search_result_notes"
 LOGIN_URL = "https://www.xiaohongshu.com/explore"
+_downloaded_url_hashes: set[str] = set()  # 全局去重：已下载图片的 URL 哈希
 SELECTORS = {
     "note_card": "section.note-item",
     "note_card_fallback": 'div[class*="note-item"]',
@@ -167,6 +169,35 @@ def _sanitize_filename(text: str, max_len: int = 20) -> str:
     return cleaned.strip() or "note"
 
 
+def _is_screenshot(filepath: str, white_ratio: float = 0.7) -> bool:
+    """快速检测图片是否为截图（尺寸比例 + 缩略图颜色分析）"""
+    try:
+        img = Image.open(filepath)
+        w, h = img.size
+        if w < 50 or h < 50:
+            return False
+
+        # 尺寸过滤：极端竖长图（手机截图比例 > 1:2）
+        aspect = max(w, h) / min(w, h) if min(w, h) > 0 else 1
+        if aspect > 2.5:
+            logger.info("skip 疑似截图: 竖长比例 %.1f:1 — %s", aspect,
+                        os.path.basename(filepath))
+            return True
+
+        # 颜色分析：缩到 50px 宽，极快
+        img = img.resize((50, int(50 * h / w)), Image.NEAREST).convert("RGB")
+        pixels = list(img.getdata())
+        white_count = sum(1 for r, g, b in pixels if r > 200 and g > 200 and b > 200)
+        ratio = white_count / len(pixels)
+        if ratio > white_ratio:
+            logger.info("skip 疑似截图: 白色占比 %.0f%% — %s", ratio * 100,
+                        os.path.basename(filepath))
+            return True
+    except Exception as e:
+        logger.debug("截图检测失败: %s — %s", filepath, e)
+    return False
+
+
 def download_image(url: str, save_dir: str, filename: Optional[str] = None) -> Optional[str]:
     """下载图片到指定目录
 
@@ -181,6 +212,13 @@ def download_image(url: str, save_dir: str, filename: Optional[str] = None) -> O
     if not _validate_image_url(url):
         logger.warning("跳过无效 URL: %s", url[:80] if url else "(空)")
         return None
+
+    # 全局去重：相同图片 URL 只下载一次
+    url_key = hashlib.md5(url.encode()).hexdigest()
+    if url_key in _downloaded_url_hashes:
+        logger.debug("跳过重复图片: %s", url[:80])
+        return None
+    _downloaded_url_hashes.add(url_key)
 
     if not filename:
         url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
@@ -278,6 +316,45 @@ def _resolve_url(href: str) -> str:
     return ""
 
 
+def _parse_note_date(text: str):
+    """解析小红书笔记的相对时间文本，返回绝对日期 date 对象（解析失败返回 None）"""
+    if not text:
+        return None
+    text = text.strip()
+    today = datetime.now().date()
+    if "今天" in text or "刚刚" in text or "分钟前" in text or "小时前" in text:
+        return today
+    if "昨天" in text:
+        return today - timedelta(days=1)
+    if "前天" in text:
+        return today - timedelta(days=2)
+    m = re.search(r"(\d+)\s*天前", text)
+    if m:
+        return today - timedelta(days=int(m.group(1)))
+    m = re.search(r"(\d+)\s*周前", text)
+    if m:
+        return today - timedelta(days=int(m.group(1)) * 7)
+    m = re.search(r"(\d+)\s*个?月前", text)
+    if m:
+        months = int(m.group(1))
+        y, mth = today.year, today.month - months
+        while mth <= 0:
+            y -= 1
+            mth += 12
+        return today.replace(year=y, month=mth)
+    m = re.search(r"(\d{1,2})\s*[-/]\s*(\d{1,2})", text)
+    if m:
+        month, day = int(m.group(1)), int(m.group(2))
+        try:
+            target = today.replace(month=month, day=day)
+            if target > today:
+                target = target.replace(year=today.year - 1)
+            return target
+        except ValueError:
+            return None
+    return None
+
+
 def scroll_page(page: Page, times: int = 3) -> None:
     """滚动页面加载更多内容"""
     for i in range(times):
@@ -327,6 +404,25 @@ def extract_notes(page: Page) -> list[dict]:
             like_text = like_el.inner_text().strip() if like_el else ""
             likes = _parse_likes(like_text)
 
+            # 提取发布时间（多策略）
+            note_date = None
+            for date_sel in [
+                '[class*="date"]', '[class*="time"]', '[class*="footer"] span',
+                '[class*="bottom"] span', '[class*="info"] span',
+                'span[class*="note"]', 'footer span',
+            ]:
+                el = card.query_selector(date_sel)
+                if el:
+                    note_date = _parse_note_date(el.inner_text().strip())
+                    if note_date:
+                        break
+            if not note_date:
+                all_text = card.inner_text()
+                for line in all_text.split("\n"):
+                    note_date = _parse_note_date(line.strip())
+                    if note_date:
+                        break
+
             a_el = card.query_selector(SELECTORS["link"])
             href = a_el.get_attribute("href") or "" if a_el else ""
             link = _resolve_url(href)
@@ -344,6 +440,7 @@ def extract_notes(page: Page) -> list[dict]:
                 "likes": likes,
                 "link": link,
                 "note_url": note_url,
+                "note_date": note_date,
             })
         except Exception as e:
             logger.debug("解析卡片出错: %s — %s", type(e).__name__, e)
@@ -355,7 +452,7 @@ def extract_notes(page: Page) -> list[dict]:
 # ── 笔记详情页图片提取 ────────────────────────────────────
 
 def extract_note_images(page: Page) -> list[str]:
-    """从笔记详情页提取所有内容图片 URL（过滤头像、图标、表情包等）"""
+    """从笔记详情页提取内容图片（仅笔记正文，过滤评论区/推荐/头像等）"""
     # 滚动以触发懒加载
     for i in range(config.NOTE_SCROLL_TIMES):
         page.evaluate("window.scrollBy(0, window.innerHeight)")
@@ -363,32 +460,104 @@ def extract_note_images(page: Page) -> list[str]:
 
     time.sleep(2)  # 等图片渲染
 
+    # 尝试锁定笔记正文容器，只取里面的图片
+    content_selectors = [
+        '[class*="note-content"]',
+        '[class*="note-detail"]',
+        'div.note-scroller',
+        '#detail-desc',
+        '[class*="article"]',
+    ]
+    container = None
+    for sel in content_selectors:
+        el = page.query_selector(sel)
+        if el:
+            container = el
+            break
+
+    imgs = container.query_selector_all("img") if container else page.query_selector_all("img")
+    logger.debug("图片容器: %s, 找到 %d 个 img", "content" if container else "全页", len(imgs))
+
+    def _has_ancestor_class(img_element, keywords, depth=5):
+        """检查祖先元素 class 是否包含指定关键词"""
+        try:
+            text = img_element.evaluate(f"""
+                el => {{
+                    let text = el.className || '';
+                    let parent = el.parentElement;
+                    for (let i = 0; i < {depth} && parent; i++) {{
+                        text += ' ' + (parent.className || '');
+                        parent = parent.parentElement;
+                    }}
+                    return text.toLowerCase();
+                }}
+            """)
+        except Exception:
+            return False
+        return any(kw in text for kw in keywords)
+
+    def _is_avatar(img_element) -> bool:
+        """多维度判断图片是否为头像"""
+        if _has_ancestor_class(img_element, ["avatar", "author-avatar", "user-avatar",
+                                              "profile-pic", "head-image", "head-img",
+                                              "portrait", "author-image"]):
+            return True
+        alt = (img_element.get_attribute("alt") or "").lower()
+        if "头像" in alt or "avatar" in alt:
+            return True
+        src = img_element.get_attribute("src") or ""
+        src_lower = src.lower()
+        if any(p in src_lower for p in ["/avatar/", "/avatars/", "avatar.", "avatar-",
+                                         "xhs-avatar", "xhscdn.com/avatar"]):
+            return True
+        try:
+            w = img_element.evaluate("el => el.naturalWidth || el.width || 0")
+            h = img_element.evaluate("el => el.naturalHeight || el.height || 0")
+            if isinstance(w, (int, float)) and isinstance(h, (int, float)):
+                if w > 0 and h > 0:
+                    ratio = max(w, h) / min(w, h) if min(w, h) > 0 else 99
+                    if max(w, h) < 200 and ratio < 1.5:
+                        return True
+        except Exception:
+            pass
+        return False
+
     images = []
-    imgs = page.query_selector_all("img")
     for img in imgs:
         # ── 1. 获取 src ──
         src = img.get_attribute("src") or img.get_attribute("data-src") or ""
         if not src or src.startswith("data:"):
             continue
 
-        # ── 2. 过滤 class（头像、图标、二维码等） ──
+        # ── 2. 头像检测 ──
+        if _is_avatar(img):
+            logger.debug("跳过头像: %s", src[:80])
+            continue
+
+        # ── 3. 过滤评论区/推荐区（祖先 class 含关键词） ──
+        if _has_ancestor_class(img, ["comment", "reply", "comment-item", "comment-list",
+                                      "recommend", "related-note", "note-item",
+                                      "sidebar", "footer"]):
+            logger.debug("跳过评论/推荐: %s", src[:80])
+            continue
+
+        # ── 4. 过滤 class（图标、二维码等） ──
         cls = img.get_attribute("class") or ""
         parent_cls = ""
         try:
             parent_cls = img.evaluate("el => el.parentElement?.className || ''")
         except Exception:
             pass
-
-        skip = ["avatar", "logo", "icon", "qrcode", "worldcup", "header"]
+        skip = ["logo", "icon", "qrcode", "worldcup", "header"]
         combined = (cls + " " + parent_cls).lower()
         if any(p in combined for p in skip):
             continue
 
-        # ── 3. 过滤非内容 CDN（fe-platform 是平台图标） ──
+        # ── 5. 过滤非内容 CDN ──
         if "fe-platform.xhscdn.com" in src:
             continue
 
-        # ── 4. 过滤小图（表情包尺寸通常 < 100px） ──
+        # ── 6. 过滤小图（表情包尺寸通常 < 100px） ──
         try:
             w = img.evaluate("el => el.naturalWidth || el.width || 0")
             h = img.evaluate("el => el.naturalHeight || el.height || 0")
@@ -397,7 +566,7 @@ def extract_note_images(page: Page) -> list[str]:
                     logger.debug("跳过小图 %dx%d: %s", w, h, src[:80])
                     continue
         except Exception:
-            pass  # 取不到尺寸也保留（可能是还没渲染完的正常图）
+            pass
 
         images.append(src)
 
@@ -467,6 +636,10 @@ def scrape_note_all_images(page: Page, note: dict, save_dir: str, note_dir: str)
                 os.remove(result)
                 logger.debug("丢弃小图 (%.0fKB): %s", size_kb, filename)
                 continue
+            # 过滤截图（聊天记录、手机截图等白色背景占大比例的图）
+            if config.SKIP_SCREENSHOTS and _is_screenshot(result, config.SCREENSHOT_WHITE_RATIO):
+                os.remove(result)
+                continue
             downloaded.append(result)
         time.sleep(0.5)  # 图片间短间隔
 
@@ -503,7 +676,38 @@ def scrape_keyword(page: Page, keyword: str, save_dir: str) -> list[str]:
     notes = extract_notes(page)
     logger.info("找到 %d 条笔记", len(notes))
 
+    # 日志：日期解析统计
+    parsed = sum(1 for n in notes if n["note_date"] is not None)
+    if parsed > 0:
+        logger.info("日期解析: %d/%d 条成功", parsed, len(notes))
+
     if not notes:
+        return []
+
+    # 日期过滤
+    start = config.DATE_FILTER_START
+    end = config.DATE_FILTER_END
+    if start or end:
+        start_date = datetime.strptime(start, "%Y-%m-%d").date() if start else None
+        end_date = datetime.strptime(end, "%Y-%m-%d").date() if end else None
+        filtered = []
+        for n in notes:
+            d = n["note_date"]
+            if d is None:
+                continue  # 无法解析日期的笔记，跳过
+            if start_date and d < start_date:
+                continue
+            if end_date and d > end_date:
+                continue
+            filtered.append(n)
+        skipped = len(notes) - len(filtered)
+        if skipped:
+            range_str = f"{start or '...'} ~ {end or '...'}"
+            logger.info("日期过滤 (%s): 保留 %d 条, 排除 %d 条", range_str, len(filtered), skipped)
+        notes = filtered
+
+    if not notes:
+        logger.warning("日期过滤后无结果")
         return []
 
     notes.sort(key=lambda x: x["likes"], reverse=True)
@@ -532,7 +736,10 @@ def scrape_keyword(page: Page, keyword: str, save_dir: str) -> list[str]:
             filename = f"{prefix}_{safe_title}.jpg"
             result = download_image(note["image_url"], save_dir, filename)
             if result:
-                downloaded.append(result)
+                if config.SKIP_SCREENSHOTS and _is_screenshot(result, config.SCREENSHOT_WHITE_RATIO):
+                    os.remove(result)
+                else:
+                    downloaded.append(result)
 
         time.sleep(config.REQUEST_DELAY)
 
@@ -603,10 +810,50 @@ def setup_image_dir() -> str:
     return path
 
 
+# ── 登录预检 ──────────────────────────────────────────────
+
+def ensure_login(page: Page, context, cookie_loaded: bool) -> bool:
+    """抓取前确认登录状态，未登录则等待用户扫码"""
+    logger.info("检查登录状态...")
+    try:
+        page.goto(SEARCH_URL.format(keyword=quote("黄金")), wait_until="domcontentloaded", timeout=30000)
+        time.sleep(3)
+    except PlaywrightTimeout:
+        logger.warning("页面加载超时，继续检查...")
+
+    if not _detect_login_wall(page):
+        logger.info("已登录，开始抓取")
+        return True
+
+    if config.HEADLESS:
+        logger.error("未登录！无头模式下无法扫码，请先关闭无头模式登录")
+        return False
+
+    if not cookie_loaded:
+        logger.warning("=" * 50)
+        logger.warning("未登录！请在浏览器窗口中扫码登录")
+        logger.warning("登录成功后脚本会自动继续...")
+        logger.warning("=" * 50)
+
+    # 等待用户扫码（只检测当前页面，不刷新/跳转）
+    count = 0
+    while True:
+        time.sleep(3)
+        count += 1
+        if not _detect_login_wall(page):
+            logger.info("登录成功！保存状态并继续抓取...")
+            _save_state(context)
+            time.sleep(1)
+            return True
+        if count % 20 == 0:
+            logger.warning("仍在等待登录... 请在浏览器中扫码")
+
+
 # ── 主流程 ────────────────────────────────────────────────
 
 def run() -> list[str]:
     """主抓取流程"""
+    _downloaded_url_hashes.clear()
     logger.info("小红书爆款图片抓取工具")
     logger.info("时间: %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     logger.info("关键词: %s", ", ".join(config.KEYWORDS))
@@ -619,11 +866,11 @@ def run() -> list[str]:
     pw = None
 
     try:
-        pw, browser, _context, page, cookie_loaded = _launch_browser()
+        pw, browser, context, page, cookie_loaded = _launch_browser()
 
-        if not cookie_loaded:
-            logger.warning("未加载 cookie，可能无法获取搜索结果")
-            logger.warning("请先运行: python scraper.py --login")
+        if not ensure_login(page, context, cookie_loaded):
+            logger.error("登录检查失败，抓取终止")
+            return []
 
         for keyword in config.KEYWORDS:
             try:
