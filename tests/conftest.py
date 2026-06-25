@@ -39,26 +39,29 @@ def sample_notes():
             "image_url": "https://sns-img.xhs.com/img_001.jpg",
             "likes": 15200,
             "link": "https://www.xiaohongshu.com/explore/abc123",
+            "note_url": "https://www.xiaohongshu.com/search_result/abc123?xsec_token=test",
         },
         {
             "title": "金手镯选购攻略",
             "image_url": "https://sns-img.xhs.com/img_002.png",
             "likes": 8300,
             "link": "https://www.xiaohongshu.com/explore/def456",
+            "note_url": "https://www.xiaohongshu.com/search_result/def456?xsec_token=test",
         },
         {
             "title": "周大福金镯子开箱",
             "image_url": "https://sns-img.xhs.com/img_003.webp",
             "likes": 500,
             "link": "https://www.xiaohongshu.com/explore/ghi789",
+            "note_url": "",
         },
     ]
 
 
 @pytest.fixture
 def mock_response():
-    """模拟成功的 HTTP 响应"""
+    """模拟成功的 HTTP 响应（>10KB 以通过最低文件大小过滤）"""
     resp = MagicMock()
     resp.status_code = 200
-    resp.content = b"\xff\xd8\xff\xe0" + b"\x00" * 1024  # 1KB 假 JPEG
+    resp.content = b"\xff\xd8\xff\xe0" + b"\x00" * 11264  # ~11KB 假 JPEG
     return resp

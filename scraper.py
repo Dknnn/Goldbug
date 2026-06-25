@@ -331,11 +331,19 @@ def extract_notes(page: Page) -> list[dict]:
             href = a_el.get_attribute("href") or "" if a_el else ""
             link = _resolve_url(href)
 
+            # 提取封面上的 xsec_token 链接（进入笔记详情页用）
+            note_url = ""
+            cover_a = card.query_selector("a.cover")
+            if cover_a:
+                cover_href = cover_a.get_attribute("href") or ""
+                note_url = _resolve_url(cover_href)
+
             notes.append({
                 "title": title[:50],
                 "image_url": img_url,
                 "likes": likes,
                 "link": link,
+                "note_url": note_url,
             })
         except Exception as e:
             logger.debug("解析卡片出错: %s — %s", type(e).__name__, e)
@@ -344,10 +352,131 @@ def extract_notes(page: Page) -> list[dict]:
     return notes
 
 
+# ── 笔记详情页图片提取 ────────────────────────────────────
+
+def extract_note_images(page: Page) -> list[str]:
+    """从笔记详情页提取所有内容图片 URL（过滤头像、图标、表情包等）"""
+    # 滚动以触发懒加载
+    for i in range(config.NOTE_SCROLL_TIMES):
+        page.evaluate("window.scrollBy(0, window.innerHeight)")
+        time.sleep(1)
+
+    time.sleep(2)  # 等图片渲染
+
+    images = []
+    imgs = page.query_selector_all("img")
+    for img in imgs:
+        # ── 1. 获取 src ──
+        src = img.get_attribute("src") or img.get_attribute("data-src") or ""
+        if not src or src.startswith("data:"):
+            continue
+
+        # ── 2. 过滤 class（头像、图标、二维码等） ──
+        cls = img.get_attribute("class") or ""
+        parent_cls = ""
+        try:
+            parent_cls = img.evaluate("el => el.parentElement?.className || ''")
+        except Exception:
+            pass
+
+        skip = ["avatar", "logo", "icon", "qrcode", "worldcup", "header"]
+        combined = (cls + " " + parent_cls).lower()
+        if any(p in combined for p in skip):
+            continue
+
+        # ── 3. 过滤非内容 CDN（fe-platform 是平台图标） ──
+        if "fe-platform.xhscdn.com" in src:
+            continue
+
+        # ── 4. 过滤小图（表情包尺寸通常 < 100px） ──
+        try:
+            w = img.evaluate("el => el.naturalWidth || el.width || 0")
+            h = img.evaluate("el => el.naturalHeight || el.height || 0")
+            if isinstance(w, (int, float)) and isinstance(h, (int, float)):
+                if w > 0 and h > 0 and (w < 100 or h < 100):
+                    logger.debug("跳过小图 %dx%d: %s", w, h, src[:80])
+                    continue
+        except Exception:
+            pass  # 取不到尺寸也保留（可能是还没渲染完的正常图）
+
+        images.append(src)
+
+    # 去重
+    seen = set()
+    unique = []
+    for url in images:
+        if url not in seen:
+            seen.add(url)
+            unique.append(url)
+
+    logger.info("  找到 %d 张图片（过滤前 %d 张）", len(unique), len(imgs))
+    return unique
+
+
+def scrape_note_all_images(page: Page, note: dict, save_dir: str, note_dir: str) -> list[str]:
+    """进入笔记详情页，下载所有图片
+
+    Args:
+        page: Playwright 页面
+        note: 笔记信息（含 note_url）
+        save_dir: 笔记专属子目录
+        note_dir: 总保存目录（未使用，保留兼容）
+
+    Returns:
+        下载的图片路径列表
+    """
+    note_url = note.get("note_url", "")
+    if not note_url:
+        logger.warning("笔记缺少详情链接，仅下载封面: %s", note["title"][:30])
+        filename = _sanitize_filename(note["title"]) + ".jpg"
+        result = download_image(note["image_url"], save_dir, filename)
+        return [result] if result else []
+
+    # 进入笔记详情页
+    try:
+        page.goto(note_url, wait_until="domcontentloaded", timeout=30000)
+        time.sleep(3)
+    except PlaywrightTimeout:
+        logger.warning("笔记详情页加载超时: %s", note["title"][:30])
+        return []
+
+    # 提取所有图片
+    image_urls = extract_note_images(page)
+    logger.info("  [%s] 找到 %d 张图片", note["title"][:20], len(image_urls))
+
+    if not image_urls:
+        # 没找到内容图，退回封面
+        filename = _sanitize_filename(note["title"]) + ".jpg"
+        result = download_image(note["image_url"], save_dir, filename)
+        return [result] if result else []
+
+    # 下载所有图片
+    downloaded = []
+    for i, img_url in enumerate(image_urls, 1):
+        ext = ".jpg"
+        for candidate in (".png", ".webp", ".jpeg", ".gif"):
+            if candidate in img_url.lower():
+                ext = candidate
+                break
+        filename = f"img_{i:03d}{ext}"
+        result = download_image(img_url, save_dir, filename)
+        if result:
+            # 过滤小于 10KB 的图片（表情包、装饰图）
+            size_kb = os.path.getsize(result) / 1024
+            if size_kb < 10:
+                os.remove(result)
+                logger.debug("丢弃小图 (%.0fKB): %s", size_kb, filename)
+                continue
+            downloaded.append(result)
+        time.sleep(0.5)  # 图片间短间隔
+
+    return downloaded
+
+
 # ── 关键词抓取 ────────────────────────────────────────────
 
 def scrape_keyword(page: Page, keyword: str, save_dir: str) -> list[str]:
-    """抓取单个关键词的笔记封面"""
+    """抓取单个关键词的笔记图片"""
     logger.info("%s", "=" * 50)
     logger.info("搜索关键词: %s", keyword)
     logger.info("%s", "=" * 50)
@@ -386,13 +515,24 @@ def scrape_keyword(page: Page, keyword: str, save_dir: str) -> list[str]:
 
     downloaded: list[str] = []
     for i, note in enumerate(top_notes, 1):
-        prefix = f"{keyword}_{i:02d}"
-        safe_title = _sanitize_filename(note["title"])
-        filename = f"{prefix}_{safe_title}.jpg"
+        if config.DOWNLOAD_MODE == "all":
+            # 为每篇笔记创建独立子目录
+            prefix = f"{keyword}_{i:02d}"
+            safe_title = _sanitize_filename(note["title"])
+            note_subdir = os.path.join(save_dir, f"{prefix}_{safe_title}")
+            os.makedirs(note_subdir, exist_ok=True)
 
-        result = download_image(note["image_url"], save_dir, filename)
-        if result:
-            downloaded.append(result)
+            results = scrape_note_all_images(page, note, note_subdir, save_dir)
+            downloaded.extend(results)
+            logger.info("  [%d/%d] %s -> %d 张图", i, len(top_notes), safe_title, len(results))
+        else:
+            # 封面模式：只下载封面图
+            prefix = f"{keyword}_{i:02d}"
+            safe_title = _sanitize_filename(note["title"])
+            filename = f"{prefix}_{safe_title}.jpg"
+            result = download_image(note["image_url"], save_dir, filename)
+            if result:
+                downloaded.append(result)
 
         time.sleep(config.REQUEST_DELAY)
 

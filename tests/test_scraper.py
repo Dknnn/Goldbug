@@ -22,6 +22,8 @@ from scraper import (
     download_image,
     scroll_page,
     extract_notes,
+    extract_note_images,
+    scrape_note_all_images,
     scrape_keyword,
     main,
 )
@@ -594,6 +596,8 @@ class TestConfig:
         assert hasattr(config, "SCROLL_TIMES")
         assert hasattr(config, "REQUEST_DELAY")
         assert hasattr(config, "STATE_FILE")
+        assert hasattr(config, "DOWNLOAD_MODE")
+        assert hasattr(config, "NOTE_SCROLL_TIMES")
         assert isinstance(config.KEYWORDS, list)
         assert len(config.KEYWORDS) > 0
         assert config.TOP_N > 0
@@ -832,3 +836,235 @@ class TestRun:
 
         # 第一个关键词成功，第二个失败，总共 1 张图
         assert len(result) == 1
+
+
+# ═══════════════════════════════════════════════════════════════
+# extract_note_images（笔记详情页图片提取）
+# ═══════════════════════════════════════════════════════════════
+
+class TestExtractNoteImages:
+    def test_extracts_content_images(self, mock_page):
+        """从笔记详情页提取内容图片，过滤头像和图标"""
+        imgs = []
+        for i in range(5):
+            img = MagicMock()
+            img.get_attribute.side_effect = lambda attr, idx=i: {
+                "src": f"https://img.xhs.com/note_photo_{idx}.jpg",
+                "data-src": "",
+                "class": "",
+            }.get(attr, "")
+            img.evaluate.return_value = "note-image-container"
+            imgs.append(img)
+
+        # 加一个头像
+        avatar = MagicMock()
+        avatar.get_attribute.side_effect = lambda attr: {
+            "src": "https://avatar.xhs.com/head.jpg",
+            "class": "author-avatar",
+        }.get(attr, "")
+        avatar.evaluate.return_value = "author-avatar-wrapper"
+        imgs.append(avatar)
+
+        # 加一个 data: URI（应被过滤）
+        data_img = MagicMock()
+        data_img.get_attribute.side_effect = lambda attr: {
+            "src": "data:image/svg+xml;base64,xxx",
+            "class": "",
+        }.get(attr, "")
+        data_img.evaluate.return_value = ""
+        imgs.append(data_img)
+
+        mock_page.query_selector_all.return_value = imgs
+
+        with patch.object(scraper.config, "NOTE_SCROLL_TIMES", 1):
+            with patch("scraper.time.sleep"):
+                result = extract_note_images(mock_page)
+                assert len(result) == 5  # 5 content + 1 filtered avatar + 1 filtered data URI
+                assert all("note_photo" in r for r in result)
+
+    def test_deduplicates_images(self, mock_page):
+        """重复 URL 只保留一次"""
+        imgs = []
+        for _ in range(3):
+            img = MagicMock()
+            img.get_attribute.side_effect = lambda attr: {
+                "src": "https://img.xhs.com/same_photo.jpg",
+                "class": "",
+            }.get(attr, "")
+            img.evaluate.return_value = ""
+            imgs.append(img)
+
+        mock_page.query_selector_all.return_value = imgs
+
+        with patch.object(scraper.config, "NOTE_SCROLL_TIMES", 0):
+            with patch("scraper.time.sleep"):
+                result = extract_note_images(mock_page)
+                assert len(result) == 1
+
+    def test_empty_page(self, mock_page):
+        """没有图片时返回空列表"""
+        mock_page.query_selector_all.return_value = []
+        with patch.object(scraper.config, "NOTE_SCROLL_TIMES", 0):
+            with patch("scraper.time.sleep"):
+                result = extract_note_images(mock_page)
+                assert result == []
+
+
+# ═══════════════════════════════════════════════════════════════
+# scrape_note_all_images（单笔记全部图片下载）
+# ═══════════════════════════════════════════════════════════════
+
+class TestScrapeNoteAllImages:
+    def test_downloads_all_images(self, mock_page, temp_dir, mock_response):
+        """进入笔记详情页，下载全部图片"""
+        note = {
+            "title": "测试笔记标题",
+            "image_url": "https://img.xhs.com/cover.jpg",
+            "note_url": "https://www.xiaohongshu.com/search_result/test123?xsec_token=abc",
+        }
+
+        # 模拟详情页图片
+        imgs = []
+        for i in range(3):
+            img = MagicMock()
+            img.get_attribute.side_effect = lambda attr, idx=i: {
+                "src": f"https://img.xhs.com/photo_{idx}.jpg",
+                "class": "",
+            }.get(attr, "")
+            img.evaluate.return_value = "note-image-container"
+            imgs.append(img)
+
+        mock_page.query_selector_all.return_value = imgs
+
+        with patch("scraper.requests.get", return_value=mock_response):
+            with patch.object(scraper.config, "NOTE_SCROLL_TIMES", 1):
+                with patch("scraper.time.sleep"):
+                    result = scrape_note_all_images(
+                        mock_page, note, temp_dir, temp_dir
+                    )
+                    assert len(result) == 3
+                    for path in result:
+                        assert os.path.isfile(path)
+
+    def test_no_note_url_falls_back_to_cover(self, mock_page, temp_dir, mock_response):
+        """没有 note_url 时退回下载封面"""
+        note = {
+            "title": "无详情链接的笔记",
+            "image_url": "https://img.xhs.com/cover_only.jpg",
+            "note_url": "",
+        }
+
+        with patch("scraper.requests.get", return_value=mock_response):
+            with patch("scraper.time.sleep"):
+                result = scrape_note_all_images(
+                    mock_page, note, temp_dir, temp_dir
+                )
+                assert len(result) == 1
+                assert "cover_only" not in os.path.basename(result[0])
+                # 文件名来自标题
+                assert os.path.isfile(result[0])
+
+    def test_page_timeout_fallback(self, mock_page, temp_dir):
+        """笔记详情页超时时返回空"""
+        note = {
+            "title": "超时笔记",
+            "image_url": "https://img.xhs.com/cover.jpg",
+            "note_url": "https://www.xiaohongshu.com/search_result/timeout?xsec_token=bad",
+        }
+        mock_page.goto.side_effect = scraper.PlaywrightTimeout("timeout")
+
+        with patch("scraper.time.sleep"):
+            result = scrape_note_all_images(mock_page, note, temp_dir, temp_dir)
+            assert result == []
+
+    def test_no_content_images_falls_back(self, mock_page, temp_dir, mock_response):
+        """详情页没有内容图时退回封面"""
+        note = {
+            "title": "空笔记",
+            "image_url": "https://img.xhs.com/cover_backup.jpg",
+            "note_url": "https://www.xiaohongshu.com/search_result/empty?xsec_token=bad",
+        }
+        mock_page.query_selector_all.return_value = []
+
+        with patch("scraper.requests.get", return_value=mock_response):
+            with patch.object(scraper.config, "NOTE_SCROLL_TIMES", 0):
+                with patch("scraper.time.sleep"):
+                    result = scrape_note_all_images(
+                        mock_page, note, temp_dir, temp_dir
+                    )
+                    assert len(result) == 1
+                    assert os.path.isfile(result[0])
+
+
+# ═══════════════════════════════════════════════════════════════
+# scrape_keyword "all" 模式
+# ═══════════════════════════════════════════════════════════════
+
+class TestScrapeKeywordAllMode:
+    def test_all_mode_downloads_all_images_per_note(self, mock_page, temp_dir, mock_response):
+        """all 模式：每篇笔记进入详情页，下载全部图片"""
+        mock_page.url = "https://www.xiaohongshu.com/search_result?keyword=xxx"
+
+        # 封面 mock
+        cover_mock = MagicMock()
+        cover_mock.get_attribute.side_effect = lambda attr: {
+            "href": "/search_result/test123?xsec_token=abc",
+        }.get(attr, "")
+
+        # 卡片 mock
+        img_el = MagicMock()
+        img_el.get_attribute.side_effect = lambda attr: {
+            "src": "https://img.xhs.com/cover.jpg",
+        }.get(attr, "")
+        title_el = MagicMock()
+        title_el.inner_text.return_value = "测试笔记A"
+        like_el = MagicMock()
+        like_el.inner_text.return_value = "500"
+        a_el = MagicMock()
+        a_el.get_attribute.return_value = "/explore/test123"
+
+        card = MagicMock()
+        card.query_selector.side_effect = lambda sel: {
+            "img": img_el,
+            '[class*="title"]': title_el,
+            '[class*="like"]': like_el,
+            "a": a_el,
+            "a.cover": cover_mock,
+        }.get(sel)
+
+        mock_page.query_selector_all.return_value = [card]
+        mock_page.wait_for_selector.return_value = None
+
+        # 模拟详情页的图片（与卡片 mock 共享 page.query_selector_all）
+        # scrape_note_all_images 会再次调用 page.query_selector_all
+        # 第一次是卡片提取，后面是详情页图片提取
+        detail_imgs = []
+        for i in range(2):
+            img = MagicMock()
+            img.get_attribute.side_effect = lambda attr, idx=i: {
+                "src": f"https://img.xhs.com/detail_{idx}.jpg",
+                "class": "",
+            }.get(attr, "")
+            img.evaluate.return_value = "note-image-container"
+            detail_imgs.append(img)
+
+        # query_selector_all 先返回卡片，再返回详情页图片
+        mock_page.query_selector_all.side_effect = [
+            [card],       # extract_notes: 卡片
+            detail_imgs,  # extract_note_images: 详情页图片
+        ]
+
+        with patch("scraper.requests.get", return_value=mock_response):
+            with patch("scraper.time.sleep"):
+                with patch.object(scraper.config, "DOWNLOAD_MODE", "all"):
+                    with patch.object(scraper.config, "SCROLL_TIMES", 1):
+                        with patch.object(scraper.config, "REQUEST_DELAY", 0):
+                            with patch.object(scraper.config, "TOP_N", 1):
+                                with patch.object(scraper.config, "NOTE_SCROLL_TIMES", 0):
+                                    result = scrape_keyword(
+                                        mock_page, "金手镯", temp_dir
+                                    )
+                                    # 2 张详情图 + 封面兜底
+                                    assert len(result) >= 2
+                                    for path in result:
+                                        assert os.path.isfile(path)

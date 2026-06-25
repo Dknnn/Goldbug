@@ -23,5 +23,11 @@ TOP_N = 15
 # 请求间隔（秒），避免太快
 REQUEST_DELAY = 2
 
+# 下载模式: "cover"=仅封面, "all"=笔记内全部图片
+DOWNLOAD_MODE = "all"
+
+# 笔记详情页滚动次数（图片懒加载）
+NOTE_SCROLL_TIMES = 2
+
 # Cookie 持久化（保存登录态，避免每次手动登录）
 STATE_FILE = "browser_state.json"  # 登录态持久化文件
