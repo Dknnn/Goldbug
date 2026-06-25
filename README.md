@@ -22,6 +22,16 @@ playwright install chromium
 python scraper.py
 ```
 
+## 测试
+
+```bash
+# 运行全部测试
+pytest tests/ -v
+
+# 含覆盖率报告
+pytest tests/ --cov=scraper --cov=config --cov-report=term-missing
+```
+
 ## 配置
 
 编辑 `config.py`：

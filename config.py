@@ -13,7 +13,7 @@ IMAGE_DIR = "images"
 ARCHIVE_BY_DATE = True
 
 # 浏览器设置
-HEADLESS = True          # True=无头模式（后台运行），False=显示浏览器窗口（调试用）
+HEADLESS = False         # False=显示浏览器（推荐，小红书会拦截无头模式），True=后台运行
 SLOW_MO = 500            # 操作间隔毫秒数，模拟人类速度
 SCROLL_TIMES = 3         # 搜索页滚动次数（越多加载越多结果）
 
@@ -22,3 +22,6 @@ TOP_N = 15
 
 # 请求间隔（秒），避免太快
 REQUEST_DELAY = 2
+
+# Cookie 持久化（保存登录态，避免每次手动登录）
+STATE_FILE = "browser_state.json"  # 登录态持久化文件

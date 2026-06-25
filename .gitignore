@@ -2,3 +2,6 @@ images/
 __pycache__/
 *.pyc
 .env
+browser_state.json
+cookies.json
+.pytest_cache/
