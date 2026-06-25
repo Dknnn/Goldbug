@@ -27,7 +27,7 @@ from playwright.sync_api import sync_playwright, Page, TimeoutError as Playwrigh
 import config
 
 # ── Windows 终端 Unicode 修复 ────────────────────────────
-if sys.platform == "win32":
+if sys.platform == "win32" and sys.stdout:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 # ── 日志配置 ──────────────────────────────────────────────
