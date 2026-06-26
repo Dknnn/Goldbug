@@ -12,6 +12,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import scraper  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def reset_download_dedup():
+    """每个测试前清空全局 URL 去重缓存，避免用例间互相污染"""
+    scraper._downloaded_url_hashes.clear()
+    yield
+    scraper._downloaded_url_hashes.clear()
+
+
 @pytest.fixture
 def temp_dir():
     """创建临时目录，测试后自动清理"""

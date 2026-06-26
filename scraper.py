@@ -213,13 +213,6 @@ def download_image(url: str, save_dir: str, filename: Optional[str] = None) -> O
         logger.warning("跳过无效 URL: %s", url[:80] if url else "(空)")
         return None
 
-    # 全局去重：相同图片 URL 只下载一次
-    url_key = hashlib.md5(url.encode()).hexdigest()
-    if url_key in _downloaded_url_hashes:
-        logger.debug("跳过重复图片: %s", url[:80])
-        return None
-    _downloaded_url_hashes.add(url_key)
-
     if not filename:
         url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
         ext = ".jpg"
@@ -234,6 +227,13 @@ def download_image(url: str, save_dir: str, filename: Optional[str] = None) -> O
     if os.path.exists(filepath):
         logger.info("跳过已存在: %s", filename)
         return filepath
+
+    # 全局去重：相同图片 URL 只下载一次（目标文件尚不存在时）
+    url_key = hashlib.md5(url.encode()).hexdigest()
+    if url_key in _downloaded_url_hashes:
+        logger.debug("跳过重复图片: %s", url[:80])
+        return None
+    _downloaded_url_hashes.add(url_key)
 
     headers = {
         "User-Agent": (

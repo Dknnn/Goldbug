@@ -802,8 +802,9 @@ class TestRun:
         mock_page.query_selector.return_value = None
         mock_page.query_selector_all.return_value = [card]
 
-        # 第二个关键词时 goto 失败（第一次正常：首页+搜索页，第二次首页即失败）
+        # ensure_login(1) + 关键词1 首页+搜索(2) + 关键词2 首页失败(1)
         mock_page.goto.side_effect = [
+            None,                                   # ensure_login
             None, None,                             # 关键词1: 首页 + 搜索
             scraper.PlaywrightTimeout("timeout"),   # 关键词2: 首页失败
         ]
