@@ -12,12 +12,13 @@
 import json
 import logging
 import os
+import random
 import re
 import sys
 import time
 import hashlib
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Callable, Optional
 from urllib.parse import quote, urlparse
 
 from PIL import Image
@@ -42,6 +43,8 @@ logger = logging.getLogger("goldbug")
 SEARCH_URL = "https://www.xiaohongshu.com/search_result?keyword={keyword}&source=web_search_result_notes"
 LOGIN_URL = "https://www.xiaohongshu.com/explore"
 _downloaded_url_hashes: set[str] = set()  # 全局去重：已下载图片的 URL 哈希
+_session: dict = {}  # 单次 run() 会话状态
+_semi_auto_confirm: Optional[Callable[[dict, int, int], str]] = None
 SELECTORS = {
     "note_card": "section.note-item",
     "note_card_fallback": 'div[class*="note-item"]',
@@ -53,6 +56,94 @@ SELECTORS = {
     "likes_fallback": '[class*="count"]',
     "link": "a",
 }
+
+# ── 安全模式 / 半自动 ────────────────────────────────────
+
+def set_semi_auto_confirm(handler: Optional[Callable[[dict, int, int], str]]) -> None:
+    """设置半自动确认回调，返回 download | skip | stop"""
+    global _semi_auto_confirm
+    _semi_auto_confirm = handler
+
+
+def request_scrape_abort() -> None:
+    config.SCRAPE_ABORT_REQUESTED = True
+
+
+def reset_scrape_abort() -> None:
+    config.SCRAPE_ABORT_REQUESTED = False
+
+
+def _should_abort() -> bool:
+    return config.SCRAPE_ABORT_REQUESTED
+
+
+def _human_delay(min_sec: Optional[float] = None, max_sec: Optional[float] = None,
+                 label: str = "") -> None:
+    """低频模式用随机延迟，否则用固定 REQUEST_DELAY"""
+    if _should_abort():
+        return
+    if config.LOW_FREQ_MODE:
+        lo = min_sec if min_sec is not None else config.LOW_FREQ_DELAY_MIN
+        hi = max_sec if max_sec is not None else config.LOW_FREQ_DELAY_MAX
+        wait = random.uniform(lo, hi)
+        if label:
+            logger.info("  等待 %.1f 秒 %s", wait, label)
+        time.sleep(wait)
+    else:
+        time.sleep(config.REQUEST_DELAY)
+
+
+def resolve_run_params() -> dict:
+    """根据安全模式开关计算本次运行有效参数"""
+    keywords = list(config.KEYWORDS)
+    top_n = config.TOP_N
+    scroll_times = config.SCROLL_TIMES
+    download_mode = config.DOWNLOAD_MODE
+
+    if config.LOW_FREQ_MODE:
+        keywords = keywords[: config.LOW_FREQ_MAX_KEYWORDS]
+        top_n = min(top_n, config.LOW_FREQ_TOP_N_CAP)
+        scroll_times = min(scroll_times, config.LOW_FREQ_SCROLL_TIMES_CAP)
+        if download_mode == "all":
+            download_mode = "cover"
+
+    return {
+        "keywords": keywords,
+        "top_n": top_n,
+        "scroll_times": scroll_times,
+        "download_mode": download_mode,
+    }
+
+
+def _semi_auto_decide(note: dict, index: int, total: int) -> str:
+    """半自动：每篇笔记前等待用户确认"""
+    if not config.SEMI_AUTO_MODE:
+        return "download"
+    if _semi_auto_confirm:
+        return _semi_auto_confirm(note, index, total)
+    logger.info("─" * 40)
+    logger.info("半自动 [%d/%d] [%d赞] %s", index, total, note["likes"], note["title"])
+    logger.info("回车=下载 | s=跳过 | q=停止")
+    try:
+        choice = input("> ").strip().lower()
+    except EOFError:
+        return "stop"
+    if choice in ("q", "quit", "停止"):
+        return "stop"
+    if choice in ("s", "skip", "跳过"):
+        return "skip"
+    return "download"
+
+
+def _session_note_limit_reached() -> bool:
+    if not config.LOW_FREQ_MODE:
+        return False
+    cap = config.LOW_FREQ_SESSION_MAX_NOTES
+    if _session.get("notes_processed", 0) >= cap:
+        logger.warning("已达单次会话上限 %d 篇，停止", cap)
+        return True
+    return False
+
 
 # ── 登录态持久化 ──────────────────────────────────────────
 
@@ -358,8 +449,10 @@ def _parse_note_date(text: str):
 def scroll_page(page: Page, times: int = 3) -> None:
     """滚动页面加载更多内容"""
     for i in range(times):
+        if _should_abort():
+            return
         page.evaluate("window.scrollBy(0, window.innerHeight)")
-        time.sleep(config.REQUEST_DELAY)
+        _human_delay(label=f"(滚动 {i + 1}/{times})")
         logger.info("  滚动 %d/%d", i + 1, times)
 
 
@@ -650,6 +743,11 @@ def scrape_note_all_images(page: Page, note: dict, save_dir: str, note_dir: str)
 
 def scrape_keyword(page: Page, keyword: str, save_dir: str) -> list[str]:
     """抓取单个关键词的笔记图片"""
+    params = _session.get("params") or resolve_run_params()
+    top_n = params["top_n"]
+    scroll_times = params["scroll_times"]
+    download_mode = params["download_mode"]
+
     logger.info("%s", "=" * 50)
     logger.info("搜索关键词: %s", keyword)
     logger.info("%s", "=" * 50)
@@ -666,12 +764,15 @@ def scrape_keyword(page: Page, keyword: str, save_dir: str) -> list[str]:
         logger.error("页面加载超时: %s", keyword)
         return []
 
+    if _should_abort():
+        return []
+
     # 检测登录墙
     if _detect_login_wall(page):
         logger.error("需要登录! 请先运行: python scraper.py --login")
         return []
 
-    scroll_page(page, config.SCROLL_TIMES)
+    scroll_page(page, scroll_times)
 
     notes = extract_notes(page)
     logger.info("找到 %d 条笔记", len(notes))
@@ -711,7 +812,7 @@ def scrape_keyword(page: Page, keyword: str, save_dir: str) -> list[str]:
         return []
 
     notes.sort(key=lambda x: x["likes"], reverse=True)
-    top_notes = notes[: config.TOP_N]
+    top_notes = notes[:top_n]
 
     logger.info("取点赞 Top %d:", len(top_notes))
     for i, note in enumerate(top_notes, 1):
@@ -719,8 +820,20 @@ def scrape_keyword(page: Page, keyword: str, save_dir: str) -> list[str]:
 
     downloaded: list[str] = []
     for i, note in enumerate(top_notes, 1):
-        if config.DOWNLOAD_MODE == "all":
-            # 为每篇笔记创建独立子目录
+        if _should_abort() or _session_note_limit_reached():
+            break
+
+        action = _semi_auto_decide(note, i, len(top_notes))
+        if action == "stop":
+            request_scrape_abort()
+            logger.warning("用户停止抓取")
+            break
+        if action == "skip":
+            logger.info("  跳过: %s", note["title"][:30])
+            _human_delay()
+            continue
+
+        if download_mode == "all":
             prefix = f"{keyword}_{i:02d}"
             safe_title = _sanitize_filename(note["title"])
             note_subdir = os.path.join(save_dir, f"{prefix}_{safe_title}")
@@ -730,7 +843,6 @@ def scrape_keyword(page: Page, keyword: str, save_dir: str) -> list[str]:
             downloaded.extend(results)
             logger.info("  [%d/%d] %s -> %d 张图", i, len(top_notes), safe_title, len(results))
         else:
-            # 封面模式：只下载封面图
             prefix = f"{keyword}_{i:02d}"
             safe_title = _sanitize_filename(note["title"])
             filename = f"{prefix}_{safe_title}.jpg"
@@ -741,7 +853,8 @@ def scrape_keyword(page: Page, keyword: str, save_dir: str) -> list[str]:
                 else:
                     downloaded.append(result)
 
-        time.sleep(config.REQUEST_DELAY)
+        _session["notes_processed"] = _session.get("notes_processed", 0) + 1
+        _human_delay()
 
     return downloaded
 
@@ -853,11 +966,27 @@ def ensure_login(page: Page, context, cookie_loaded: bool) -> bool:
 
 def run() -> list[str]:
     """主抓取流程"""
+    global _session
+    reset_scrape_abort()
     _downloaded_url_hashes.clear()
+    _session = {"notes_processed": 0, "params": resolve_run_params()}
+    params = _session["params"]
+    keywords = params["keywords"]
+
     logger.info("小红书爆款图片抓取工具")
     logger.info("时间: %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-    logger.info("关键词: %s", ", ".join(config.KEYWORDS))
-    logger.info("每个关键词取 Top %d", config.TOP_N)
+    logger.info("关键词: %s", ", ".join(keywords))
+    logger.info("每个关键词取 Top %d", params["top_n"])
+    if config.LOW_FREQ_MODE:
+        logger.info(
+            "低频模式 ON — 仅封面, 随机延迟 %d~%ds, 会话上限 %d 篇",
+            config.LOW_FREQ_DELAY_MIN, config.LOW_FREQ_DELAY_MAX,
+            config.LOW_FREQ_SESSION_MAX_NOTES,
+        )
+        if config.DOWNLOAD_MODE == "all":
+            logger.warning("低频模式已强制使用 cover（仅封面），降低风控风险")
+    if config.SEMI_AUTO_MODE:
+        logger.info("半自动模式 ON — 每篇笔记需确认后再下载")
 
     save_dir = setup_image_dir()
     logger.info("保存目录: %s", save_dir)
@@ -872,14 +1001,24 @@ def run() -> list[str]:
             logger.error("登录检查失败，抓取终止")
             return []
 
-        for keyword in config.KEYWORDS:
+        for ki, keyword in enumerate(keywords):
+            if _should_abort():
+                break
             try:
                 downloaded = scrape_keyword(page, keyword, save_dir)
                 all_downloaded.extend(downloaded)
             except Exception as e:
                 logger.error("关键词 '%s' 抓取异常: %s — %s", keyword, type(e).__name__, e)
             finally:
-                time.sleep(3)
+                if ki < len(keywords) - 1 and not _should_abort():
+                    if config.LOW_FREQ_MODE:
+                        _human_delay(
+                            config.LOW_FREQ_KEYWORD_DELAY_MIN,
+                            config.LOW_FREQ_KEYWORD_DELAY_MAX,
+                            label="(关键词间隔)",
+                        )
+                    else:
+                        time.sleep(3)
 
     except Exception as e:
         logger.error("浏览器启动失败: %s — %s", type(e).__name__, e)

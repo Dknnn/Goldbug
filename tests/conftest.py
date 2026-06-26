@@ -13,11 +13,15 @@ import scraper  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
-def reset_download_dedup():
-    """每个测试前清空全局 URL 去重缓存，避免用例间互相污染"""
+def reset_scraper_globals():
+    """每个测试前清空全局状态，避免用例间互相污染"""
     scraper._downloaded_url_hashes.clear()
+    scraper._session = {}
+    scraper.reset_scrape_abort()
+    scraper.set_semi_auto_confirm(None)
     yield
     scraper._downloaded_url_hashes.clear()
+    scraper._session = {}
 
 
 @pytest.fixture

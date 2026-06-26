@@ -28,6 +28,28 @@ log_queue: queue.Queue = queue.Queue()
 status = {"running": False, "done": False, "downloaded": 0, "start_time": None, "save_dir": ""}
 downloaded_images: list[str] = []
 
+# 半自动确认（Web UI 弹窗用）
+_confirm_event = threading.Event()
+_confirm_action = "skip"
+
+
+def _webui_semi_auto_confirm(note: dict, index: int, total: int) -> str:
+    global _confirm_action
+    _confirm_event.clear()
+    payload = json.dumps({
+        "index": index, "total": total,
+        "likes": note.get("likes", 0), "title": note.get("title", ""),
+    }, ensure_ascii=False)
+    log_queue.put(json.dumps({
+        "time": datetime.now().strftime("%H:%M:%S"),
+        "level": "__CONFIRM__",
+        "msg": payload,
+    }))
+    if not _confirm_event.wait(timeout=300):
+        scraper.logger.warning("半自动确认超时，跳过该笔记")
+        return "skip"
+    return _confirm_action
+
 
 # ── SSE 日志桥接 ─────────────────────────────────────────
 class SSEHandler(logging.Handler):
@@ -61,6 +83,11 @@ def _run_scrape():
     downloaded_images = []
 
     try:
+        scraper.reset_scrape_abort()
+        if config.SEMI_AUTO_MODE:
+            scraper.set_semi_auto_confirm(_webui_semi_auto_confirm)
+        else:
+            scraper.set_semi_auto_confirm(None)
         results = scraper.run()
         downloaded_images = results
         status["downloaded"] = len(results)
@@ -94,6 +121,10 @@ def api_start():
         config.DATE_FILTER_START = data["date_filter_start"] or None
     if data.get("date_filter_end") is not None:
         config.DATE_FILTER_END = data["date_filter_end"] or None
+    if data.get("low_freq_mode") is not None:
+        config.LOW_FREQ_MODE = bool(data["low_freq_mode"])
+    if data.get("semi_auto_mode") is not None:
+        config.SEMI_AUTO_MODE = bool(data["semi_auto_mode"])
 
     threading.Thread(target=_run_scrape, daemon=True).start()
     return jsonify({"ok": True})
@@ -101,10 +132,21 @@ def api_start():
 
 @app.route("/api/stop", methods=["POST"])
 def api_stop():
-    # 通过设置标志位让抓取线程感知（简化处理：标记 done 让后续循环跳出）
     scraper.logger.warning("用户请求停止抓取")
-    # 实际停止依赖 daemon 线程自然退出
+    scraper.request_scrape_abort()
     status["running"] = False
+    return jsonify({"ok": True})
+
+
+@app.route("/api/confirm", methods=["POST"])
+def api_confirm():
+    global _confirm_action
+    data = request.get_json(silent=True) or {}
+    action = data.get("action", "skip")
+    if action not in ("download", "skip", "stop"):
+        action = "skip"
+    _confirm_action = action
+    _confirm_event.set()
     return jsonify({"ok": True})
 
 
@@ -150,6 +192,8 @@ def api_status():
         "headless": config.HEADLESS,
         "date_filter_start": config.DATE_FILTER_START,
         "date_filter_end": config.DATE_FILTER_END,
+        "low_freq_mode": config.LOW_FREQ_MODE,
+        "semi_auto_mode": config.SEMI_AUTO_MODE,
     })
 
 
@@ -442,6 +486,18 @@ select.config-input { appearance:none; background-image:url("data:image/svg+xml,
       <div class="toggle" id="headlessToggle" onclick="toggleHeadless()"></div>
     </div>
     <span style="font-size:10px;color:var(--text-secondary);">后台运行，不显示浏览器窗口</span>
+
+    <div class="toggle-row" style="margin-top:10px;">
+      <span class="toggle-label">低频模式</span>
+      <div class="toggle on" id="lowFreqToggle" onclick="toggleLowFreq()"></div>
+    </div>
+    <span style="font-size:10px;color:var(--text-secondary);">慢速随机延迟、限量、仅封面</span>
+
+    <div class="toggle-row" style="margin-top:10px;">
+      <span class="toggle-label">半自动</span>
+      <div class="toggle" id="semiAutoToggle" onclick="toggleSemiAuto()"></div>
+    </div>
+    <span style="font-size:10px;color:var(--text-secondary);">每篇笔记弹窗确认后再下载</span>
   </div>
 </div>
 
@@ -480,10 +536,25 @@ select.config-input { appearance:none; background-image:url("data:image/svg+xml,
 <!-- ═══ Toast ═══ -->
 <div class="toast" id="toast"></div>
 
+<!-- ═══ 半自动确认 ═══ -->
+<div id="confirmModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:999;align-items:center;justify-content:center;">
+  <div style="background:#fff;border-radius:12px;padding:20px 24px;max-width:420px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,.2);">
+    <div style="font-size:13px;font-weight:600;margin-bottom:8px;">半自动确认</div>
+    <div id="confirmText" style="font-size:12px;color:#333;line-height:1.6;margin-bottom:16px;white-space:pre-wrap;"></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;">
+      <button class="btn btn-ghost" onclick="answerConfirm('skip')">跳过</button>
+      <button class="btn btn-danger" onclick="answerConfirm('stop')">停止</button>
+      <button class="btn btn-primary" onclick="answerConfirm('download')">下载</button>
+    </div>
+  </div>
+</div>
+
 <script>
 let keywords = ["金手镯","黄金手镯","金镯子"];
 let es = null;
 let headlessOn = false;
+let lowFreqOn = true;
+let semiAutoOn = false;
 let statusDone = false;
 
 // ── Init ──
@@ -495,6 +566,9 @@ fetch("/api/status").then(r=>r.json()).then(s=>{
   if(s.date_filter_start) document.getElementById("dateStart").value = s.date_filter_start;
   if(s.date_filter_end) document.getElementById("dateEnd").value = s.date_filter_end;
   if(s.headless) { headlessOn=true; document.getElementById("headlessToggle").classList.add("on"); }
+  if(s.low_freq_mode !== false) { lowFreqOn=true; document.getElementById("lowFreqToggle").classList.add("on"); }
+  else { lowFreqOn=false; document.getElementById("lowFreqToggle").classList.remove("on"); }
+  if(s.semi_auto_mode) { semiAutoOn=true; document.getElementById("semiAutoToggle").classList.add("on"); }
   renderKeywords();
 });
 renderKeywords();
@@ -525,6 +599,28 @@ function toggleHeadless(){
   headlessOn = !headlessOn;
   document.getElementById("headlessToggle").classList.toggle("on", headlessOn);
 }
+function toggleLowFreq(){
+  lowFreqOn = !lowFreqOn;
+  document.getElementById("lowFreqToggle").classList.toggle("on", lowFreqOn);
+}
+function toggleSemiAuto(){
+  semiAutoOn = !semiAutoOn;
+  document.getElementById("semiAutoToggle").classList.toggle("on", semiAutoOn);
+}
+
+function showConfirmModal(info){
+  const m = document.getElementById("confirmModal");
+  document.getElementById("confirmText").textContent =
+    `[${info.index}/${info.total}]  ${info.likes}赞\n${info.title}`;
+  m.style.display = "flex";
+}
+function answerConfirm(action){
+  document.getElementById("confirmModal").style.display = "none";
+  fetch("/api/confirm", {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({action})
+  });
+}
 
 // ── Console ──
 function addConsole(msg, tag) {
@@ -547,6 +643,10 @@ function connectLogs(){
     try{
       const d = JSON.parse(e.data);
       if(d.level === "__DONE__") { es.close(); es=null; refreshImages(); refreshStatus(); return; }
+      if(d.level === "__CONFIRM__") {
+        try { showConfirmModal(JSON.parse(d.msg)); } catch(ex){}
+        return;
+      }
       let tag = null;
       if(d.level==="INFO") tag="info";
       else if(d.level==="WARNING") tag="warn";
@@ -629,6 +729,8 @@ function doStart(){
       download_mode: document.getElementById("downloadMode").value,
       date_filter_start: ds||null,
       date_filter_end: de||null,
+      low_freq_mode: lowFreqOn,
+      semi_auto_mode: semiAutoOn,
     })
   }).then(r=>r.json()).then(d=>{
     if(d.ok){ connectLogs(); refreshStatus(); }

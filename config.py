@@ -39,3 +39,20 @@ DATE_FILTER_END = None    # 结束日期 "YYYY-MM-DD"（None = 不限）
 # 过滤截图：跳过白色背景占比过高的图片（聊天截图、手机截图等）
 SKIP_SCREENSHOTS = True       # 是否开启截图过滤
 SCREENSHOT_WHITE_RATIO = 0.7  # 白色/浅色像素占比阈值（0.7 = 70%）
+
+# ── 安全模式开关 ──────────────────────────────────────────
+LOW_FREQ_MODE = True          # 低频模式：随机延迟、限量、强制封面
+SEMI_AUTO_MODE = False        # 半自动模式：每篇笔记需人工确认后再下载
+
+# 低频模式参数（仅 LOW_FREQ_MODE=True 时生效）
+LOW_FREQ_TOP_N_CAP = 5              # 每个关键词最多抓取篇数
+LOW_FREQ_MAX_KEYWORDS = 1           # 单次运行最多处理几个关键词
+LOW_FREQ_SESSION_MAX_NOTES = 10     # 单次运行最多处理笔记总数
+LOW_FREQ_DELAY_MIN = 8              # 操作间隔下限（秒）
+LOW_FREQ_DELAY_MAX = 15             # 操作间隔上限（秒）
+LOW_FREQ_KEYWORD_DELAY_MIN = 30     # 关键词之间间隔下限（秒）
+LOW_FREQ_KEYWORD_DELAY_MAX = 60     # 关键词之间间隔上限（秒）
+LOW_FREQ_SCROLL_TIMES_CAP = 2       # 搜索页最多滚动次数
+
+# 运行时停止标志（由 GUI/WebUI 停止按钮设置，勿手动改）
+SCRAPE_ABORT_REQUESTED = False

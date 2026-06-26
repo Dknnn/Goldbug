@@ -1058,14 +1058,15 @@ class TestScrapeKeywordAllMode:
         with patch("scraper.requests.get", return_value=mock_response):
             with patch("scraper.time.sleep"):
                 with patch.object(scraper.config, "DOWNLOAD_MODE", "all"):
-                    with patch.object(scraper.config, "SCROLL_TIMES", 1):
-                        with patch.object(scraper.config, "REQUEST_DELAY", 0):
-                            with patch.object(scraper.config, "TOP_N", 1):
-                                with patch.object(scraper.config, "NOTE_SCROLL_TIMES", 0):
-                                    result = scrape_keyword(
-                                        mock_page, "金手镯", temp_dir
-                                    )
-                                    # 2 张详情图 + 封面兜底
-                                    assert len(result) >= 2
-                                    for path in result:
-                                        assert os.path.isfile(path)
+                    with patch.object(scraper.config, "LOW_FREQ_MODE", False):
+                        with patch.object(scraper.config, "SCROLL_TIMES", 1):
+                            with patch.object(scraper.config, "REQUEST_DELAY", 0):
+                                with patch.object(scraper.config, "TOP_N", 1):
+                                    with patch.object(scraper.config, "NOTE_SCROLL_TIMES", 0):
+                                        result = scrape_keyword(
+                                            mock_page, "金手镯", temp_dir
+                                        )
+                                        # 2 张详情图 + 封面兜底
+                                        assert len(result) >= 2
+                                        for path in result:
+                                            assert os.path.isfile(path)

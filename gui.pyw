@@ -200,6 +200,17 @@ class GoldbugGUI:
         Checkbutton(row2, text="无头模式", variable=self.headless_var,
                     font=self.font_ui, bg="#fff").pack(side="left", padx=(0, 12))
 
+        row3 = Frame(frame, bg="#fff")
+        row3.grid(row=3, column=0, columnspan=8, sticky="w", pady=(4, 0))
+        self.low_freq_var = BooleanVar(value=config.LOW_FREQ_MODE)
+        Checkbutton(row3, text="低频模式", variable=self.low_freq_var,
+                    font=self.font_ui, bg="#fff").pack(side="left", padx=(0, 12))
+        self.semi_auto_var = BooleanVar(value=config.SEMI_AUTO_MODE)
+        Checkbutton(row3, text="半自动", variable=self.semi_auto_var,
+                    font=self.font_ui, bg="#fff").pack(side="left", padx=(0, 12))
+        Label(row3, text="低频=慢速限量仅封面 · 半自动=每篇需确认",
+              font=("Microsoft YaHei", 9), bg="#fff", fg="#999").pack(side="left")
+
         # 按钮
         self.btn_start = Button(row2, text="▶  开始抓取", font=self.font_ui, bg="#ee5a24", fg="#fff",
                                 relief="flat", padx=18, pady=2, cursor="hand2",
@@ -299,6 +310,26 @@ class GoldbugGUI:
         self.root.after(1000, self._poll_status)
 
     # ── 操作 ───────────────────────────────────────────────
+    def _semi_auto_confirm(self, note, index, total):
+        result = ["skip"]
+        event = threading.Event()
+        title = note.get("title", "")[:40]
+        prompt = f"[{index}/{total}]  {note.get('likes', 0)}赞\n{title}"
+
+        def ask():
+            ans = messagebox.askyesnocancel("半自动确认", f"{prompt}\n\n是=下载  否=跳过  取消=停止")
+            if ans is True:
+                result[0] = "download"
+            elif ans is False:
+                result[0] = "skip"
+            else:
+                result[0] = "stop"
+            event.set()
+
+        self.root.after(0, ask)
+        event.wait(timeout=300)
+        return result[0]
+
     def _start(self):
         global status, scrape_thread
         if status["running"]:
@@ -322,6 +353,13 @@ class GoldbugGUI:
             return
         config.DATE_FILTER_START = date_start if date_start not in ("起始日期", "") else None
         config.DATE_FILTER_END = date_end if date_end not in ("结束日期", "") else None
+        config.LOW_FREQ_MODE = self.low_freq_var.get()
+        config.SEMI_AUTO_MODE = self.semi_auto_var.get()
+        scraper.reset_scrape_abort()
+        if config.SEMI_AUTO_MODE:
+            scraper.set_semi_auto_confirm(self._semi_auto_confirm)
+        else:
+            scraper.set_semi_auto_confirm(None)
 
         # 清空日志
         self.log_text.configure(state="normal")
@@ -330,6 +368,13 @@ class GoldbugGUI:
         self._append_log(f"开始抓取: {', '.join(keywords)}", "INFO")
         date_info = f"{config.DATE_FILTER_START or '...'} ~ {config.DATE_FILTER_END or '...'}"
         self._append_log(f"Top {config.TOP_N} · 模式: {config.DOWNLOAD_MODE} · 日期: {date_info} · 无头: {config.HEADLESS}", "DIM")
+        modes = []
+        if config.LOW_FREQ_MODE:
+            modes.append("低频")
+        if config.SEMI_AUTO_MODE:
+            modes.append("半自动")
+        if modes:
+            self._append_log(f"安全模式: {', '.join(modes)}", "DIM")
 
         scrape_thread = threading.Thread(target=_run_scrape, daemon=True)
         scrape_thread.start()
@@ -337,6 +382,7 @@ class GoldbugGUI:
     def _stop(self):
         global status
         status["running"] = False
+        scraper.request_scrape_abort()
         scraper.logger.warning("用户请求停止")
         self.status_label.configure(text="停止中...")
         self.btn_stop.configure(state="disabled")
