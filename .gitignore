@@ -10,3 +10,6 @@ Goldbug.spec
 build/
 dist/
 *.log
+
+# 本地环境安装脚本（不上传）
+小虫/
